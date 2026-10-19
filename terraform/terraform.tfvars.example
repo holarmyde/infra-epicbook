@@ -1,0 +1,2 @@
+admin_source_cidr    = "YOUR_PUBLIC_IP/32"
+mysql_admin_password = "REPLACE_WITH_A_STRONG_UNIQUE_PASSWORD"

@@ -1,0 +1,56 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr: none
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: TerraformPlan
+    displayName: Terraform validation and plan
+    jobs:
+      - job: ValidateAndPlan
+        displayName: Validate EpicBook infrastructure
+        steps:
+          - checkout: self
+
+          - task: AzureCLI@2
+            displayName: Terraform init, validate, and plan
+            inputs:
+              azureSubscription: sc-epicbook-azure
+              scriptType: bash
+              scriptLocation: inlineScript
+              workingDirectory: $(Build.SourcesDirectory)/terraform
+              inlineScript: |
+                set -euo pipefail
+
+                TERRAFORM_VERSION="1.16.1"
+                curl -fsSLo /tmp/terraform.zip \
+                  "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+                unzip -o /tmp/terraform.zip -d /tmp/terraform-bin
+                sudo install /tmp/terraform-bin/terraform /usr/local/bin/terraform
+
+                terraform version
+                terraform fmt -check -recursive
+                terraform init -input=false -reconfigure
+                terraform validate
+
+                KEY_FILE="${AGENT_TEMPDIRECTORY}/epicbook_id_ed25519.pub"
+                printf '%s\n' "$EPICBOOK_SSH_PUBLIC_KEY" > "$KEY_FILE"
+                chmod 600 "$KEY_FILE"
+                export TF_VAR_ssh_public_key_path="$KEY_FILE"
+
+                terraform plan \
+                  -input=false \
+                  -lock-timeout=60s \
+                  -out="${AGENT_TEMPDIRECTORY}/epicbook.tfplan"
+
+                echo "Terraform plan completed. Review the plan above."
+            env:
+              EPICBOOK_SSH_PUBLIC_KEY: $(sshPublicKey)
+              TF_VAR_admin_source_cidr: $(adminSourceCidr)
+              TF_VAR_admin_source_cidrs: '["$(adminSourceCidr)"]'
+              TF_VAR_mysql_admin_password: $(mysqlAdminPassword)
