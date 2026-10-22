@@ -1,9 +1,13 @@
+
 trigger:
   branches:
     include:
       - main
 
 pr: none
+
+variables:
+  - group: EpicBook-Production-Variables
 
 pool:
   vmImage: ubuntu-latest
@@ -18,7 +22,7 @@ stages:
           - checkout: self
 
           - task: AzureCLI@2
-            displayName: Terraform init, validate, and plan
+            displayName: Validate and create reviewed plan
             inputs:
               azureSubscription: sc-epicbook-azure
               scriptType: bash
@@ -27,9 +31,12 @@ stages:
               inlineScript: |
                 set -euo pipefail
 
-                TERRAFORM_VERSION="1.16.1"
+                sudo apt-get update -qq
+                sudo apt-get install -y -qq curl unzip jq
+
+                VERSION="1.16.1"
                 curl -fsSLo /tmp/terraform.zip \
-                  "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip"
+                  "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
                 unzip -o /tmp/terraform.zip -d /tmp/terraform-bin
                 sudo install /tmp/terraform-bin/terraform /usr/local/bin/terraform
 
@@ -38,19 +45,124 @@ stages:
                 terraform init -input=false -reconfigure
                 terraform validate
 
-                KEY_FILE="${AGENT_TEMPDIRECTORY}/epicbook_id_ed25519.pub"
+                KEY_FILE="$(Agent.TempDirectory)/epicbook_id_ed25519.pub"
                 printf '%s\n' "$EPICBOOK_SSH_PUBLIC_KEY" > "$KEY_FILE"
                 chmod 600 "$KEY_FILE"
                 export TF_VAR_ssh_public_key_path="$KEY_FILE"
 
+                PLAN_FILE="$(Agent.TempDirectory)/epicbook.tfplan"
+                PLAN_JSON="$(Agent.TempDirectory)/epicbook-plan.json"
+
                 terraform plan \
                   -input=false \
                   -lock-timeout=60s \
-                  -out="${AGENT_TEMPDIRECTORY}/epicbook.tfplan"
+                  -out="$PLAN_FILE"
 
-                echo "Terraform plan completed. Review the plan above."
+                terraform show -json "$PLAN_FILE" > "$PLAN_JSON"
+
+                # Stop on deletions or changes to network security controls.
+                if ! jq -e '
+                  [
+                    .resource_changes[]?
+                    | select(.change.actions != ["no-op"])
+                    | select(
+                        (.change.actions | index("delete")) != null
+                        or
+                        (.type | test(
+                          "network_security_group|network_security_rule|network_interface_security_group_association|subnet_network_security_group_association"
+                        ))
+                      )
+                  ] | length == 0
+                ' "$PLAN_JSON" >/dev/null; then
+                  echo "SAFETY CHECK FAILED: review deletions or network security changes."
+                  exit 1
+                fi
+
+                mkdir -p "$(Build.ArtifactStagingDirectory)"
+                cp "$PLAN_FILE" "$(Build.ArtifactStagingDirectory)/epicbook.tfplan"
+                echo "Plan passed the configured safety checks."
+
             env:
               EPICBOOK_SSH_PUBLIC_KEY: $(sshPublicKey)
               TF_VAR_admin_source_cidr: $(adminSourceCidr)
-              TF_VAR_admin_source_cidrs: '["$(adminSourceCidr)"]'
+              TF_VAR_admin_source_cidrs: $(adminSourceCidrs)
+              TF_VAR_mysql_admin_password: $(mysqlAdminPassword)
+
+          - task: PublishPipelineArtifact@1
+            displayName: Publish reviewed Terraform plan
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/epicbook.tfplan
+              artifact: epicbook-reviewed-plan
+
+  - stage: Approval
+    displayName: Manual plan approval
+    dependsOn: TerraformPlan
+    condition: succeeded()
+    jobs:
+      - job: ManualApproval
+        displayName: Review before applying
+        pool: server
+        timeoutInMinutes: 1500
+        steps:
+          - task: ManualValidation@1
+            timeoutInMinutes: 1440
+            inputs:
+              notifyUsers: ''
+              instructions: |
+                Review the TerraformPlan stage logs and the reviewed plan artifact.
+                Confirm every proposed resource change is expected.
+                Reject this run if any change is unclear or unsafe.
+                Approve only after the plan has been reviewed.
+              onTimeout: reject
+
+  - stage: TerraformApply
+    displayName: Apply approved Terraform plan
+    dependsOn: Approval
+    condition: succeeded()
+    jobs:
+      - job: ApplyReviewedPlan
+        displayName: Apply exact saved plan
+        steps:
+          - checkout: self
+
+          - task: DownloadPipelineArtifact@2
+            displayName: Download reviewed plan
+            inputs:
+              artifact: epicbook-reviewed-plan
+              path: $(Pipeline.Workspace)/epicbook-reviewed-plan
+
+          - task: AzureCLI@2
+            displayName: Initialize and apply reviewed plan
+            inputs:
+              azureSubscription: sc-epicbook-azure
+              scriptType: bash
+              scriptLocation: inlineScript
+              workingDirectory: $(Build.SourcesDirectory)/terraform
+              inlineScript: |
+                set -euo pipefail
+
+                sudo apt-get update -qq
+                sudo apt-get install -y -qq curl unzip
+
+                VERSION="1.16.1"
+                curl -fsSLo /tmp/terraform.zip \
+                  "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip"
+                unzip -o /tmp/terraform.zip -d /tmp/terraform-bin
+                sudo install /tmp/terraform-bin/terraform /usr/local/bin/terraform
+
+                terraform init -input=false -reconfigure
+
+                PLAN_FILE="$(Pipeline.Workspace)/epicbook-reviewed-plan/epicbook.tfplan"
+                test -f "$PLAN_FILE" || {
+                  echo "ERROR: Reviewed plan artifact is missing."
+                  exit 1
+                }
+
+                terraform apply -input=false "$PLAN_FILE"
+                terraform output
+
+            env:
+              EPICBOOK_SSH_PUBLIC_KEY: $(sshPublicKey)
+              TF_VAR_admin_source_cidr: $(adminSourceCidr)
+              TF_VAR_admin_source_cidrs: $(adminSourceCidrs)
               TF_VAR_mysql_admin_password: $(mysqlAdminPassword)
