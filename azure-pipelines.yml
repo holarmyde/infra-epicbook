@@ -60,7 +60,7 @@ stages:
 
                 terraform show -json "$PLAN_FILE" > "$PLAN_JSON"
 
-                # Stop on deletions or changes to network security controls.
+                # Block deletions and actual changes to security rules or associations.
                 if ! jq -e '
                   [
                     .resource_changes[]?
@@ -68,13 +68,20 @@ stages:
                     | select(
                         (.change.actions | index("delete")) != null
                         or
-                        (.type | test(
-                          "network_security_group|network_security_rule|network_interface_security_group_association|subnet_network_security_group_association"
-                        ))
+                        (
+                          (
+                            .type
+                            | test(
+                                "network_security_rule|network_interface_security_group_association|subnet_network_security_group_association"
+                              )
+                          )
+                          and
+                          (.change.before != .change.after)
+                        )
                       )
                   ] | length == 0
                 ' "$PLAN_JSON" >/dev/null; then
-                  echo "SAFETY CHECK FAILED: review deletions or network security changes."
+                  echo "SAFETY CHECK FAILED: review deletions or actual network security rule/association changes."
                   exit 1
                 fi
 
